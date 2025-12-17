@@ -1,0 +1,15 @@
+{
+  "tasks": {
+    "dev": "deno run --watch --allow-all roles.ts"
+  },
+  "imports": {
+    "@discordjs/rest": "npm:@discordjs/rest@^2.6.0",
+    "@discordjs/ws": "npm:@discordjs/ws@^2.0.4",
+    "@effect/platform-node": "npm:@effect/platform-node@^0.103.0",
+    "@supabase/supabase-js": "jsr:@supabase/supabase-js@^2.88.0",
+    "dfx": "npm:dfx@^0.127.0",
+    "discord-api-types": "npm:discord-api-types@^0.38.37",
+    "dotenv": "npm:dotenv@^17.2.3",
+    "effect": "npm:effect@^3.19.12"
+  }
+}
