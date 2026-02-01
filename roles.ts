@@ -49,13 +49,28 @@ const manager = new WebSocketManager({
 
 manager.on(WebSocketShardEvents.Dispatch, async (event) => {
   switch (event.t) {
-    case GatewayDispatchEvents.Ready:
+    case GatewayDispatchEvents.Ready: {
+      console.log(`Logged in as ${event.d.user.username}`);
+
+      // The Ready event payload contains 'guilds' which are the servers the bot is IN.
+      const actualGuildIds = event.d.guilds.map(g => g.id);
+      console.log("--- BOT IS CURRENTLY IN THESE GUILDS ---");
+      console.log(actualGuildIds);
+      console.log("----------------------------------------");
+
+      // Check for mismatches
+      const missing = guildIds.filter(id => !actualGuildIds.includes(id));
+      if (missing.length > 0) {
+        console.error("    CONFIG ERROR: The bot is NOT in these servers:", missing);
+      }
+
+      
       console.log(`Starting sync for ${guildIds.length} guild(s)...`)
       await initialSync()
-      console.log("Sync complete! Exiting.")
-      Deno.exit(0) //Added for Batch Sync
+      //console.log("Sync complete! Exiting.")
+      //Deno.exit(0) //Added for Batch Sync
       break
-
+    }
     case GatewayDispatchEvents.GuildMemberUpdate: {
       const { guild_id, user, roles } = event.d
       if (guildIds.includes(guild_id)) {
@@ -67,7 +82,7 @@ manager.on(WebSocketShardEvents.Dispatch, async (event) => {
     case GatewayDispatchEvents.GuildMemberRemove: {
       const { guild_id, user } = event.d
       if (guildIds.includes(guild_id)) {
-        await removeUserRoles(guild_id, user.id)
+        await removeUserRoles(guild_id, user.id, user.username)
       }
       break
     }
@@ -75,6 +90,11 @@ manager.on(WebSocketShardEvents.Dispatch, async (event) => {
 })
 
 manager.on(WebSocketShardEvents.Error, (error) => {
+  // Ignore InvalidStateError during reconnection - it's expected when the WebSocket is reconnecting
+  if (error instanceof Error && error.message.includes("'readyState' not OPEN")) {
+    console.warn("WebSocket temporarily disconnected, will auto-reconnect:", error.message)
+    return
+  }
   console.error("WebSocket error:", error)
   throw error
 })
@@ -108,12 +128,12 @@ function fetchGuildMembersPage(guildId: string, after?: string): Promise<APIGuil
   return rest.get(Routes.guildMembers(guildId), { query }) as Promise<APIGuildMember[]>
 }
 
-async function initialSync(): Promise<void> {
-  for (const guildId of guildIds) {
-    console.log(`Syncing guild: ${guildId}`)
+async function syncGuild(guildId: string): Promise<boolean> {
+  console.log(`Syncing guild: ${guildId}`)
 
-    // Fetch all members from Discord
-    const guildMembers: APIGuildMember[] = []
+  // Fetch all members from Discord
+  const guildMembers: APIGuildMember[] = []
+  try {
     let page = await fetchGuildMembersPage(guildId)
     guildMembers.push(...page)
 
@@ -122,31 +142,55 @@ async function initialSync(): Promise<void> {
       page = await fetchGuildMembersPage(guildId, lastMember.user?.id)
       guildMembers.push(...page)
     }
-
-    console.log(`Found ${guildMembers.length} members in guild ${guildId}`)
-
-    // Sync all members' roles
-    const syncResults = await Promise.allSettled(
-      guildMembers
-        .filter(member => member.user?.id)
-        .map(member => syncUserRoles(guildId, member.user!.id, member.roles))
-    )
-
-    const failures = syncResults.filter(r => r.status === 'rejected')
-    if (failures.length > 0) {
-      console.error(`Failed to sync ${failures.length} members in guild ${guildId}`)
+  } catch (error) {
+    const discordError = error as { code?: number; message?: string }
+    if (discordError.code === 10004) {
+      console.error(`Guild ${guildId}: Bot is not a member of this guild (Unknown Guild)`)
+    } else if (discordError.code === 50001) {
+      console.error(`Guild ${guildId}: Missing access - check bot permissions`)
+    } else {
+      console.error(`Guild ${guildId}: Failed to fetch members -`, discordError.message ?? error)
     }
+    return false
+  }
 
-    // Remove users no longer in the Discord guild
-    const discordUserIds = new Set(guildMembers.map(m => m.user?.id).filter(Boolean))
-    const cachedKeys = [...rolesCache.keys()].filter(key => key.startsWith(`${guildId}:`))
+  console.log(`Found ${guildMembers.length} members in guild ${guildId}`)
 
-    for (const key of cachedKeys) {
-      const discordId = key.split(':')[1]
-      if (!discordUserIds.has(discordId)) {
-        await removeUserRoles(guildId, discordId)
-      }
+  // Sync all members' roles
+  const syncResults = await Promise.allSettled(
+    guildMembers
+      .filter(member => member.user?.id)
+      .map(member => syncUserRoles(guildId, member.user!.id, member.roles))
+  )
+
+  const failures = syncResults.filter(r => r.status === 'rejected')
+  if (failures.length > 0) {
+    console.error(`Failed to sync ${failures.length} members in guild ${guildId}`)
+  }
+
+  // Remove users no longer in the Discord guild
+  const discordUserIds = new Set(guildMembers.map(m => m.user?.id).filter(Boolean))
+  const cachedKeys = [...rolesCache.keys()].filter(key => key.startsWith(`${guildId}:`))
+
+  for (const key of cachedKeys) {
+    const discordId = key.split(':')[1]
+    if (!discordUserIds.has(discordId)) {
+      await removeUserRoles(guildId, discordId)
     }
+  }
+
+  return true
+}
+
+async function initialSync(): Promise<void> {
+  const results = await Promise.allSettled(guildIds.map(syncGuild))
+
+  const succeeded = results.filter(r => r.status === 'fulfilled' && r.value === true).length
+  const failed = guildIds.length - succeeded
+
+  console.log(`Sync summary: ${succeeded}/${guildIds.length} guilds succeeded`)
+  if (failed > 0) {
+    console.warn(`${failed} guild(s) failed to sync - check logs above for details`)
   }
 }
 
@@ -166,7 +210,7 @@ async function upsertUserRoles(guildId: string, discordId: string, roles: string
   rolesCache.set(cacheKey(guildId, discordId), roles)
 }
 
-async function removeUserRoles(guildId: string, discordId: string): Promise<void> {
+async function removeUserRoles(guildId: string, discordId: string, username?: string): Promise<void> {
   const { error } = await supabase
     .from(TABLE_NAME)
     .delete()
@@ -179,7 +223,8 @@ async function removeUserRoles(guildId: string, discordId: string): Promise<void
   }
 
   rolesCache.delete(cacheKey(guildId, discordId))
-  console.log(`Removed ${discordId} from guild ${guildId}`)
+  const userInfo = username ? `${username} (${discordId})` : discordId
+  console.log(`Removed ${userInfo} from guild ${guildId}`)
 }
 
 async function syncUserRoles(guildId: string, discordId: string, roles: string[]): Promise<void> {
